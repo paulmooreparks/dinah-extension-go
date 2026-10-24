@@ -1,0 +1,86 @@
+package extension
+
+import (
+	"archive/zip"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func packageFixture(t *testing.T) (string, ed25519.PrivateKey) {
+	t.Helper()
+	root := t.TempDir()
+	_, key, _ := ed25519.GenerateKey(rand.Reader)
+	m := Manifest{ID: "test.extension", Version: "0.1.0", Contract: 1, Title: "Fixture", Publisher: Publisher{Name: "Fixture"}, Backends: map[string]string{"windows": "backend.exe", "linux": "backend.exe"}, Permissions: []string{"workspace.read"}, Actions: []Action{{Name: "status", Title: "Status", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`), Replay: "pure"}}, Views: []View{{ID: "main", Title: "Main", Page: "index.html"}}}
+	data, _ := json.Marshal(m)
+	os.WriteFile(filepath.Join(root, ManifestFile), data, 0600)
+	os.WriteFile(filepath.Join(root, "backend.exe"), []byte("not executable"), 0600)
+	os.WriteFile(filepath.Join(root, "index.html"), []byte("<p>Fixture</p>"), 0600)
+	return root, key
+}
+func TestSignedInventoryAndPinnedPublisher(t *testing.T) {
+	root, key := packageFixture(t)
+	m, err := Sign(root, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = Verify(root); err != nil {
+		t.Fatal(err)
+	}
+	s := Store{Root: filepath.Join(t.TempDir(), "extensions")}
+	if _, err = s.Install(root, "fixture", Approval{}); err == nil {
+		t.Fatal("installed without consent fingerprint")
+	}
+	if _, err = s.Install(root, "fixture", Approval{Fingerprint(m.Publisher.Key), m.Signature}); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(root, "index.html"), []byte("changed"), 0600)
+	if _, err = Verify(root); err == nil {
+		t.Fatal("accepted modified payload")
+	}
+	_, other, _ := ed25519.GenerateKey(rand.Reader)
+	m, err = Sign(root, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Install(root, "other", Approval{Fingerprint(m.Publisher.Key), m.Signature}); err == nil {
+		t.Fatal("changed publisher key silently")
+	}
+	if err = s.Remove("../escape"); err == nil {
+		t.Fatal("unsafe removal")
+	}
+	if err = s.Remove("test.extension"); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestZipRejectsTraversalAndCollisions(t *testing.T) {
+	for _, names := range [][]string{{"../escape"}, {"A.js", "a.js"}, {"/absolute"}, {"a\\b"}} {
+		archive := filepath.Join(t.TempDir(), "extension.zip")
+		f, _ := os.Create(archive)
+		w := zip.NewWriter(f)
+		for _, p := range names {
+			entry, _ := w.Create(p)
+			entry.Write([]byte("x"))
+		}
+		w.Close()
+		f.Close()
+		if err := Unzip(archive, t.TempDir()); err == nil {
+			t.Fatalf("accepted %v", names)
+		}
+	}
+}
+func TestProcessActionsCannotClaimPureReplay(t *testing.T) {
+	root, _ := packageFixture(t)
+	m, err := ReadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Permissions = append(m.Permissions, "process.run:git")
+	m.Actions[0].Permissions = []string{"process.run:git"}
+	if m.Validate() == nil {
+		t.Fatal("process action bypassed once policy")
+	}
+}

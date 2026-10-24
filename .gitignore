@@ -1,0 +1,4 @@
+/dist/
+/bin/
+.keys/
+*.private-key
