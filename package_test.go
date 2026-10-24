@@ -37,6 +37,16 @@ func TestSignedInventoryAndPinnedPublisher(t *testing.T) {
 	if _, err = s.Install(root, "fixture", Approval{Fingerprint(m.Publisher.Key), m.Signature}); err != nil {
 		t.Fatal(err)
 	}
+	if err = s.Review(m.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Install(root, "fixture", Approval{Fingerprint(m.Publisher.Key), m.Signature}); err != nil {
+		t.Fatal(err)
+	}
+	installed, _ := s.List()
+	if len(installed) != 1 || !installed[0].ReviewCommands {
+		t.Fatal("update lost command review preference")
+	}
 	os.WriteFile(filepath.Join(root, "index.html"), []byte("changed"), 0600)
 	if _, err = Verify(root); err == nil {
 		t.Fatal("accepted modified payload")
@@ -54,6 +64,18 @@ func TestSignedInventoryAndPinnedPublisher(t *testing.T) {
 	}
 	if err = s.Remove("test.extension"); err != nil {
 		t.Fatal(err)
+	}
+}
+func TestPortablePackageNames(t *testing.T) {
+	for _, p := range []string{"NUL", "sub/CON.txt", "COM1.js", "LPT²", "trailing. ", "part/..", "bad:name", "bad?name", "line\nname", "a\\b", "../outside", "/root"} {
+		if SafePath(p) {
+			t.Errorf("accepted unsafe name %q", p)
+		}
+	}
+	for _, p := range []string{"web/index.html", "bin/extension.exe", "normal name.txt", "icon-dark.svg"} {
+		if !SafePath(p) {
+			t.Errorf("refused safe name %q", p)
+		}
 	}
 }
 func TestZipRejectsTraversalAndCollisions(t *testing.T) {
