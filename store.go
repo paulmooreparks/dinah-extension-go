@@ -218,10 +218,6 @@ func (s Store) Remove(id string) error {
 	if _, ok := all[id]; !ok {
 		return errors.New("extension is not installed")
 	}
-	delete(all, id)
-	if err = s.write(all); err != nil {
-		return err
-	}
 	target := filepath.Join(s.Root, id)
 	absolute, err := filepath.Abs(target)
 	if err != nil {
@@ -231,5 +227,11 @@ func (s Store) Remove(id string) error {
 	if err != nil || filepath.Dir(absolute) != base {
 		return fmt.Errorf("removal is outside extension store")
 	}
-	return os.RemoveAll(absolute)
+	// Keep a failed removal visible and retryable. In particular, Windows
+	// may refuse deletion while a backend still holds its executable open.
+	if err = os.RemoveAll(absolute); err != nil {
+		return err
+	}
+	delete(all, id)
+	return s.write(all)
 }
