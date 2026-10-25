@@ -1,6 +1,6 @@
 const {test}=require('node:test'),assert=require('node:assert/strict'),vm=require('node:vm'),fs=require('node:fs'),path=require('node:path'),crypto=require('node:crypto');
 function fixture(){
- const handlers={},posted=[],document={activeElement:null,documentElement:{dataset:{},style:{setProperty(){}}},addEventListener(){},querySelectorAll(){return this.fallbacks||[];}};
+ const handlers={},posted=[],documentHandlers={},document={activeElement:null,documentElement:{dataset:{},style:{setProperty(){}}},addEventListener(name,fn){documentHandlers[name]=fn;},querySelectorAll(){return this.fallbacks||[];}};
  const control=(name,options={})=>({name,isConnected:true,tabIndex:0,disabled:false,...options,matches(){return this.disabled;},closest(){return this.inert?{}:null;},getClientRects(){return this.hidden?[]:[{}];},hasAttribute(){return false;},focus(){if(!this.disabled&&!this.hidden&&!this.inert)document.activeElement=this;}});
  document.body=control('body');const parent={},window={addEventListener(name,fn){handlers[name]=fn;}};
  const port={postMessage(value){posted.push(value);},start(){},close(){}};
@@ -8,8 +8,10 @@ function fixture(){
  handlers.message({source:parent,data:{type:'dinah-extension-init',version:1,appearance:{mode:'light',tokens:{}},workspace:{}},ports:[port]});
  const emit=(event,data)=>port.onmessage({data:{version:1,event,data}});
  async function excursion(target,result={focused:true}){document.activeElement=target;const promise=window.dinah.hostCommand('focus-menubar');await Promise.resolve();await Promise.resolve();const request=posted.at(-1);port.onmessage({data:{version:1,reply:request.id,...(result.error?{error:result.error}:{result})}});try{await promise;}catch{}return request.focusToken;}
- return{document,control,emit,excursion};
+ return{document,control,emit,excursion,focus(target){document.activeElement=target;documentHandlers.focusin({target});}};
 }
 test('stale focus return retains a newer excursion',async()=>{const f=fixture(),first=f.control('first'),second=f.control('second'),other=f.control('other');const old=await f.excursion(first),current=await f.excursion(second);f.document.activeElement=other;f.emit('focus-return',{token:old});assert.equal(f.document.activeElement,other);f.emit('focus-return',{token:current});assert.equal(f.document.activeElement,second);});
 test('failed or rejected menubar entry disarms its return token',async()=>{for(const result of [{focused:false},{error:'unavailable'}]){const f=fixture(),input=f.control('input'),other=f.control('other'),token=await f.excursion(input,result);f.document.activeElement=other;f.emit('focus-return',{token});assert.equal(f.document.activeElement,other);}});
 test('restoration skips disabled, removed, hidden and inert controls',async()=>{for(const property of ['disabled','hidden','inert','removed']){const f=fixture(),input=f.control('input'),hidden=f.control('hidden',{hidden:true}),main=f.control('main');f.document.fallbacks=[hidden,main];const token=await f.excursion(input);if(property==='removed')input.isConnected=false;else input[property]=true;f.document.activeElement=f.document.body;f.emit('focus-return',{token});assert.equal(f.document.activeElement,main);}});
+
+test('host-prepared native excursion restores the last child control and rejects stale tokens',()=>{const f=fixture(),first=f.control('first'),second=f.control('second');f.focus(first);f.document.activeElement=f.document.body;f.emit('focus-prepare',{token:'native-excursion-first'});f.focus(second);f.emit('focus-prepare',{token:'native-excursion-second'});f.document.activeElement=f.document.body;f.emit('focus-return',{token:'native-excursion-first'});assert.equal(f.document.activeElement,f.document.body);f.emit('focus-return',{token:'native-excursion-second'});assert.equal(f.document.activeElement,second);});
