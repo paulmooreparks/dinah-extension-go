@@ -4,7 +4,7 @@ The `contract` member of the manifest selects this contract. Package version and
 
 ## Manifest and signing
 
-`Manifest` is the authoritative schema. It declares identity, publisher, operating-system backend paths, permissions, actions, frontend views, commands and the SHA-256 inventory of every payload file. An action has a name, title, description, input and output JSON schemas, permissions and replay policy. A command names either a declared view or a declared action.
+`Manifest` is the authoritative schema. It declares identity, publisher, operating-system backend paths, permissions, actions, frontend views, commands and the SHA-256 inventory of every payload file. An action has a name, title, description, input and output JSON schemas, permissions, replay policy and an optional effect level. A view has an ID, title, glyph and page, and may be a pane or a following window. A command refers to either a declared view or a declared action.
 
 The signature is Ed25519 over UTF-8 JSON produced by Go's `encoding/json.Marshal` of `Manifest` with `Signature` set to the empty string. This is a specified Go serialization contract, not a language-independent canonical JSON standard. The signature includes the publisher public key and the complete inventory. Unknown manifest fields are rejected. Payload filenames are case-insensitively unique and portable across the supported desktop operating systems.
 
@@ -20,7 +20,20 @@ Dinah supplies `_meta["com.parkscomputing.dinah/host"]` on each `tools/call`. It
 
 This callback transport is a Dinah protocol. It does not assume MCP permits a server to issue a reverse `tools/call`. The callback server rejects browser Origin headers. Redirects are disabled by the SDK client.
 
-Process actions and workspace writes use `replay: "once"`. A failed or interrupted action is never automatically replayed. Read-only actions with no process permission may use `pure`. All `process.run:<program>` actions conservatively require agent consent, including commands intended to read status.
+Process actions and workspace writes use `replay: "once"`. A failed or interrupted action is never automatically replayed. Read-only actions with no process permission may use `pure`. A `process.run:<program>` action with no declared effect conservatively requires agent consent, including commands intended to read status.
+
+## Effect levels
+
+An action's optional `effect` member says what the action does to the person's work, so that Dinah can ask about the actions that matter and let the rest run. The four levels are these.
+
+| Effect | Meaning | Examples |
+| --- | --- | --- |
+| `read` | Reads state and changes nothing. | status, log, diff, branch listing |
+| `local` | Changes local state in a way the person can undo from inside the tool. | stage, unstage, switch branch, stash, commit |
+| `history` | Rewrites or discards history or work that cannot be recovered from inside the tool. | discard, reset, force operations, delete branch |
+| `network` | Reaches a remote or any network. | fetch, pull, push |
+
+Dinah asks a chat's person for consent before an agent runs an action whose effect is `history` or `network`, and before an action with no declared effect that has a process, write or terminal permission. Show Me First, when the person turns it on for the extension, reviews the external commands of those same actions and lets `read` and `local` commands run without a review. The level is part of the signed manifest, and the backend's `tools/list` metadata must match it. The level does not change what an action may call; permissions still bound every host service, and a frame's own confirmations for destructive operations remain the extension's responsibility.
 
 ## Host services
 
@@ -54,10 +67,26 @@ Load `/extension-sdk/dinah-extension.js` before the extension's own scripts. Loa
 | API | Behavior |
 | --- | --- |
 | `dinah.call(action,input)` | Calls a declared action of this extension and resolves to its structured output. |
-| `dinah.on(event,handler)` | Subscribes and returns an unsubscribe function. Events include `workspace`, `appearance`, `state` and `command`. |
-| `dinah.commands(list)` | Replaces the view's current command descriptors. Each descriptor has an ID, label and optional glyph, disabled, danger and shortcut fields. |
+| `dinah.on(event,handler)` | Subscribes and returns an unsubscribe function. Events include `workspace`, `appearance`, `state`, `command` and `shared`. |
+| `dinah.commands(list)` | Replaces the view's current command descriptors. Each descriptor has an ID, label and optional glyph, disabled, danger and shortcut fields. The ID `pin-workspace` is reserved for the host's pin command. |
 | `dinah.navigate(state)` | Writes a string of up to 8,192 characters into the owning window's addressable navigation state. |
-| `dinah.hostCommand(name)` | Invokes an allowlisted host command. Contract 1 exposes `focus-menubar` and `keyboard-shortcuts`. |
+| `dinah.hostCommand(name,payload)` | Invokes an allowlisted host command, with an optional JSON payload. Contract 1 exposes `focus-menubar`, `keyboard-shortcuts`, `toggle-fullscreen`, `open-view/<view-id>` and `open-diff`. |
+| `dinah.shared.get()` | Returns a copy of the extension's shared map for the frame's current workspace. |
+| `dinah.shared.set(key,value)` | Writes one key of the shared map and resolves when the host has delivered it. A value of `null` or `undefined` removes the key. |
+
+### Shared state
+
+Frames of one extension that show the same workspace share one map of JSON values, which the host keeps in memory while any frame of the extension lives. The map is not persisted and is not visible to other extensions. A key matches `^[a-z0-9][-a-z0-9_.]{0,63}$`; a value's JSON is at most 64 KiB, and a map holds at most 64 keys. A newly opened frame receives the current map before `dinah.ready` resolves, so `dinah.shared.get()` is complete at that point. Each change made by another frame arrives as a `shared` event `{key,value,from}`, where `from` is the view ID of the frame that wrote it and `value` is `null` for a removal. The writer does not receive its own event. When a following view moves to another workspace, the frame receives that workspace's map as `shared` events with an empty `from`, one per key.
+
+### Views, windows and the workspace
+
+A view declared `pane: true` is docked and follows the selected workspace. A view declared `follows: true` opens as a window that also follows the selected workspace, and the host adds a checkable "Pin to This Workspace" command to the window's own commands; while pinned, the window keeps the workspace it had when pinned, and unpinning lets it follow again. The window's title detail shows the workspace's name while the view follows. A view with neither member opens a window that takes the selected workspace at opening and keeps it. Every change of a frame's workspace, including a pin or unpin, arrives as a `workspace` event whose snapshot is the workspace; a following view's snapshot also has a `pinned` boolean.
+
+`dinah.hostCommand('open-view/<view-id>')` opens one of the extension's own declared views with the calling frame's current addressable state. When a window of that view is already open in the same workspace, the host raises it and delivers the new state through its `state` event instead of opening another. Passing `{reuse: false}` as the payload opens a further window. The result is `{window}`, the host's key for the window.
+
+### Diffs in the Editor
+
+`dinah.hostCommand('open-diff', spec)` opens a diff in Dinah's Editor. `DiffSpec` in the Go package is the authoritative shape: `{key, title, detail, path, language, before, after, mode, readOnly, actions}`, where `mode` is `inline` or `split` and each action is `{id, label, glyph, scope, primary, danger}` with `scope` one of `file`, `hunk` or `line`. The host refuses a specification that fails `DiffSpec.Validate`: a key and title of at most 200 characters, a detail of at most 500, a path of at most 1,024, a side of at most 2 MiB, at most 20 actions, and action IDs matching `^[-a-z0-9]{1,64}$`. When the person takes an action in the diff, the frame receives a `command` event `{id: 'diff/<action id>', diff: key, where}`, where `where` describes the file, hunk or line range the Editor supplied. A host whose Editor has no diff view fails with "The Editor's diff view is not available".
 
 The frame uses `sandbox="allow-scripts allow-forms"`, retains an opaque origin, and receives a response CSP with `form-action 'none'`. Forms can perform local validation and submit handlers; browser form requests are blocked. External network connections are unavailable unless the manifest declares `network`, which permits HTTPS connections. The frame cannot use the native Go bridge or inspect the parent DOM. Local popovers remain inside its bounds.
 

@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -92,6 +93,82 @@ func TestZipRejectsTraversalAndCollisions(t *testing.T) {
 		if err := Unzip(archive, t.TempDir()); err == nil {
 			t.Fatalf("accepted %v", names)
 		}
+	}
+}
+func TestEffectAndFollowsAreSignedAndUnknownFieldsRejected(t *testing.T) {
+	root, key := packageFixture(t)
+	m, err := ReadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Permissions = append(m.Permissions, "process.run:git")
+	m.Actions[0].Permissions = []string{"process.run:git"}
+	m.Actions[0].Replay = "once"
+	m.Actions[0].Effect = EffectLocal
+	m.Actions = append(m.Actions, Action{Name: "push", Title: "Push", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: json.RawMessage(`{"type":"object"}`), Permissions: []string{"process.run:git"}, Replay: "once", Effect: EffectNetwork})
+	m.Views = append(m.Views, View{ID: "window", Title: "Window", Page: "index.html", Follows: true})
+	data, _ := json.Marshal(m)
+	os.WriteFile(filepath.Join(root, ManifestFile), data, 0600)
+	signed, err := Sign(root, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err := Verify(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.Signature != signed.Signature || verified.Actions[0].Effect != EffectLocal || verified.Actions[1].Effect != EffectNetwork || !verified.Views[1].Follows {
+		t.Fatal("effect levels or follows did not survive signing")
+	}
+	if !EffectAsks("") || !EffectAsks(EffectHistory) || !EffectAsks(EffectNetwork) || EffectAsks(EffectRead) || EffectAsks(EffectLocal) {
+		t.Fatal("effect consent rule is wrong")
+	}
+	m.Actions[0].Effect = "harmless"
+	if m.Validate() == nil {
+		t.Fatal("accepted an unknown effect level")
+	}
+	// The signed JSON with a field this contract does not define is still refused.
+	var loose map[string]any
+	json.Unmarshal(data, &loose)
+	loose["shared"] = true
+	data, _ = json.Marshal(loose)
+	os.WriteFile(filepath.Join(root, ManifestFile), data, 0600)
+	if _, err = ReadManifest(root); err == nil {
+		t.Fatal("accepted an unknown manifest field")
+	}
+}
+func TestDiffSpecValidation(t *testing.T) {
+	good := DiffSpec{Key: "README.md@index", Title: "README.md", Detail: "Staged", Path: "README.md", Language: "markdown", Before: "a\n", After: "b\n", Mode: "split", Actions: []DiffAction{{ID: "stage-hunk", Label: "Stage Hunk", Glyph: "plus", Scope: "hunk", Primary: true}, {ID: "discard", Label: "Discard", Scope: "line", Danger: true}}}
+	if err := good.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for name, change := range map[string]func(*DiffSpec){
+		"missing key":        func(d *DiffSpec) { d.Key = " " },
+		"long key":           func(d *DiffSpec) { d.Key = string(make([]byte, DiffKeyLimit+1)) },
+		"control in title":   func(d *DiffSpec) { d.Title = "a\x00b" },
+		"oversized side":     func(d *DiffSpec) { d.After = string(make([]byte, DiffSideLimit+1)) },
+		"unknown mode":       func(d *DiffSpec) { d.Mode = "three-way" },
+		"bad action id":      func(d *DiffSpec) { d.Actions[0].ID = "Stage Hunk" },
+		"repeated action id": func(d *DiffSpec) { d.Actions[1].ID = d.Actions[0].ID },
+		"bad scope":          func(d *DiffSpec) { d.Actions[0].Scope = "repository" },
+		"empty label":        func(d *DiffSpec) { d.Actions[0].Label = "" },
+		"bad language":       func(d *DiffSpec) { d.Language = "C Sharp" },
+		"too many actions": func(d *DiffSpec) {
+			for i := 0; i <= DiffActionsLimit; i++ {
+				d.Actions = append(d.Actions, DiffAction{ID: fmt.Sprintf("a%d", i), Label: "A", Scope: "file"})
+			}
+		},
+	} {
+		spec := good
+		spec.Actions = append([]DiffAction{}, good.Actions...)
+		change(&spec)
+		if spec.Validate() == nil {
+			t.Errorf("accepted a diff with %s", name)
+		}
+	}
+	sides := DiffSpec{Key: "k", Title: "t", Before: string(make([]byte, DiffSideLimit)), After: ""}
+	if err := sides.Validate(); err != nil {
+		t.Fatal("refused a side at the limit", err)
 	}
 }
 func TestProcessActionsCannotClaimPureReplay(t *testing.T) {

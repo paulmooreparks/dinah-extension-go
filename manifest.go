@@ -26,6 +26,10 @@ type Action struct {
 	OutputSchema json.RawMessage `json:"outputSchema"`
 	Permissions  []string        `json:"permissions"`
 	Replay       string          `json:"replay"`
+	// Effect is the action's declared effect level: "read", "local",
+	// "history" or "network". An empty value keeps the conservative rule,
+	// under which every process, write and terminal action asks.
+	Effect string `json:"effect,omitempty"`
 }
 type View struct {
 	ID    string `json:"id"`
@@ -33,6 +37,33 @@ type View struct {
 	Glyph string `json:"glyph"`
 	Page  string `json:"page"`
 	Pane  bool   `json:"pane,omitempty"`
+	// Follows makes a window take the selected workspace as a pane does,
+	// with a pin the person may set. A window without it pins at opening.
+	Follows bool `json:"follows,omitempty"`
+}
+
+// Effect levels an action may declare.
+const (
+	EffectRead    = "read"
+	EffectLocal   = "local"
+	EffectHistory = "history"
+	EffectNetwork = "network"
+)
+
+func ValidEffect(effect string) bool {
+	switch effect {
+	case "", EffectRead, EffectLocal, EffectHistory, EffectNetwork:
+		return true
+	}
+	return false
+}
+
+// EffectAsks says whether an action at this effect level is one Dinah asks
+// about before an agent runs it, and one Show Me First reviews. Reads and
+// reversible local changes run at once; rewriting history, reaching a
+// network and an undeclared level ask.
+func EffectAsks(effect string) bool {
+	return effect == "" || effect == EffectHistory || effect == EffectNetwork
 }
 type Command struct {
 	ID     string `json:"id"`
@@ -123,7 +154,7 @@ func (m Manifest) Validate() error {
 	}
 	actions := map[string]bool{}
 	for _, a := range m.Actions {
-		if !localID.MatchString(a.Name) || actions[a.Name] || a.Title == "" || !json.Valid(a.InputSchema) || !json.Valid(a.OutputSchema) || (a.Replay != "pure" && a.Replay != "once") {
+		if !localID.MatchString(a.Name) || actions[a.Name] || a.Title == "" || !json.Valid(a.InputSchema) || !json.Valid(a.OutputSchema) || (a.Replay != "pure" && a.Replay != "once") || !ValidEffect(a.Effect) {
 			return fmt.Errorf("invalid action %q", a.Name)
 		}
 		actions[a.Name] = true
