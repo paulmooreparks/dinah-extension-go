@@ -4,13 +4,25 @@ The `contract` member of the manifest selects this contract. Package version and
 
 ## Manifest and signing
 
-`Manifest` is the authoritative schema. It declares identity, publisher, operating-system backend paths, permissions, actions, frontend views, commands and the SHA-256 inventory of every payload file. An action has a name, title, description, input and output JSON schemas, permissions, replay policy and an optional effect level. A view has an ID, title, glyph and page, and may be a pane or a following window. A command refers to either a declared view or a declared action.
+`Manifest` is the authoritative schema. It declares identity, publisher, operating-system backend paths, permissions, actions, frontend views, commands and the SHA-256 inventory of every payload file. An action has a name, title, description, input and output JSON schemas, permissions, replay policy and an optional effect level. A view has an ID, title, glyph and page, and may be a pane or a following window; a window that is neither may declare the kinds of file it opens (see Views that open files). A command refers to either a declared view or a declared action.
 
 The signature is Ed25519 over UTF-8 JSON produced by Go's `encoding/json.Marshal` of `Manifest` with `Signature` set to the empty string. This is a specified Go serialization contract, not a language-independent canonical JSON standard. The signature includes the publisher public key and the complete inventory. Unknown manifest fields are rejected. Payload filenames are case-insensitively unique and portable across the supported desktop operating systems.
 
 The installer pins the publisher key per extension ID. Consent binds both the fingerprint and exact package signature. A version already installed cannot be replaced by different content. Store registry changes are locked and replaced atomically. Removing an extension removes its package versions and private extension data.
 
 An inventory has at most 4,096 files and 256 MiB total payload; an individual file is limited to 128 MiB. The manifest is limited to 1 MiB. Packages contain their manifest at the archive root.
+
+### Members added within contract 1
+
+Contract 1 grows only by optional members. A manifest that leaves them out is unchanged: it serializes, signs and validates exactly as it did before they existed, so existing packages keep their signatures and install in every host. Because a host rejects manifest fields it does not know, a package that uses an added member installs only in a host built with the SDK release that added it or a later one. An older host refuses such a package at installation with an unknown-field error, before anything is stored or run, so it never runs a package with part of its manifest ignored.
+
+| Member | Added in SDK |
+| --- | --- |
+| Action `effect` | 0.2.0 |
+| View `follows` | 0.2.0 |
+| View `opens` | 0.2.0 |
+
+`Manifest.MinimumSDK` returns the earliest release whose hosts accept a manifest, and `dinah-extension sign` and `verify` print it when it is later than 0.1.0. A publisher who needs a package to install in older hosts leaves the newer members out.
 
 ## Backend transport
 
@@ -71,6 +83,7 @@ Load `/extension-sdk/dinah-extension.js` before the extension's own scripts. Loa
 | `dinah.commands(list)` | Replaces the view's current command descriptors. Each descriptor has an ID, label and optional glyph, disabled, danger and shortcut fields. The ID `pin-workspace` is reserved for the host's pin command. |
 | `dinah.navigate(state)` | Writes a string of up to 8,192 characters into the owning window's addressable navigation state. |
 | `dinah.hostCommand(name,payload)` | Invokes an allowlisted host command, with an optional JSON payload. Contract 1 exposes `focus-menubar`, `keyboard-shortcuts`, `toggle-fullscreen`, `open-view/<view-id>` and `open-diff`. |
+| `dinah.openedFile(state)` | Returns the file in a state Dinah gave the view to open a file, `{path, mediaType, resource, line}`, or `null` for any other state. |
 | `dinah.shared.get()` | Returns a copy of the extension's shared map for the frame's current workspace. |
 | `dinah.shared.set(key,value)` | Writes one key of the shared map and resolves when the host has delivered it. A value of `null` or `undefined` removes the key. |
 
@@ -83,6 +96,40 @@ Frames of one extension that show the same workspace share one map of JSON value
 A view declared `pane: true` is docked and follows the selected workspace. A view declared `follows: true` opens as a window that also follows the selected workspace, and the host adds a checkable "Pin to This Workspace" command to the window's own commands; while pinned, the window keeps the workspace it had when pinned, and unpinning lets it follow again. The window's title detail shows the workspace's name while the view follows. A view with neither member opens a window that takes the selected workspace at opening and keeps it. Every change of a frame's workspace, including a pin or unpin, arrives as a `workspace` event whose snapshot is the workspace; a following view's snapshot also has a `pinned` boolean.
 
 `dinah.hostCommand('open-view/<view-id>')` opens one of the extension's own declared views with the calling frame's current addressable state. When a window of that view is already open in the same workspace, the host raises it and delivers the new state through its `state` event instead of opening another. Passing `{reuse: false}` as the payload opens a further window. The result is `{window}`, the host's key for the window.
+
+### Views that open files
+
+A window view may declare the kinds of file it opens, so that a link to such a file in Dinah opens in the view. The optional `opens` member is a list of file types, each an IANA media type and the file extensions that have it:
+
+```json
+{"id": "patch", "title": "Patch", "glyph": "document", "page": "patch.html",
+ "opens": [{"mediaType": "text/x-diff", "extensions": [".diff", ".patch"]}]}
+```
+
+`FileType` and `View.Opens` in the Go package are the authoritative shape, and `Manifest.Validate` enforces these rules:
+
+- A view that declares `opens` is a window that is neither `pane` nor `follows`, because a file belongs to one workspace and such a window keeps the workspace it opened with.
+- The manifest has the `workspace.read` permission, which the view needs to read the file.
+- A media type is a registered top-level type (`application`, `audio`, `font`, `image`, `model`, `text` or `video`), a slash and a subtype of the characters RFC 6838 allows, in lower case, with no parameters, and at most 127 characters long.
+- `text/plain` and `application/octet-stream` are refused, because they describe any file rather than a kind of file.
+- A file type lists between 1 and 16 extensions. An extension is a dot followed by one segment of at most 31 lower-case letters, digits, underscores, plus signs and hyphens.
+- A view declares at most 8 file types and a manifest at most 32. A media type, and likewise an extension, appears at most once in a manifest.
+
+Wildcards such as `image/*` are not accepted. The host decides by a file's extension, so a wildcard would not say which files it covers, and it would quietly take in types that a later host opens itself or that the publisher never tried. A view that opens several types lists each of them.
+
+`opens` is signed with the rest of the manifest. It was added in SDK 0.2.0, and an older host refuses a package that uses it, as Members added within contract 1 describes.
+
+A file matches a declared type when the host already knows the file's extension as that media type, or when the host has no media type of its own for the extension and the type lists it. A declaration never changes the type of an extension the host already knows. A declaration is a request, and the host decides precedence: a kind of file the host opens in its own views stays there, and when two extensions declare the same type or extension, the one enabled first opens it. A view therefore cannot rely on receiving every file it declares. The host opens a declared file in the view only when the file is inside a source of one of the person's workspaces.
+
+When the person opens such a file, the host opens the view in the file's workspace with this navigation state, the JSON text of `OpenState`:
+
+```json
+{"open": {"path": "C:\\work\\project\\fix.diff", "mediaType": "text/x-diff",
+          "resource": {"workspaceId": "...", "sourceId": "...", "path": "fix.diff"},
+          "line": 12}}
+```
+
+`path` is the file's absolute path, which `host.read` accepts within its 2 MiB limit. `mediaType` is the declared type the file matched. `resource` is the file's workspace, the workspace source it is in and its path within that source with forward slashes. `line` is present when the link asked for a line. A newly opened window receives the state from `dinah.ready`; when a window of the view is already open in that workspace, the host raises it and delivers the state through its `state` event, as `open-view` does. `dinah.openedFile(state)` in the browser bridge and `ParseOpenState` in the Go package read the state and return nothing for any other state, so a view may keep states of its own. The state is the window's addressable state like any other: a view that later calls `dinah.navigate` replaces it, and a window restored after a restart receives whatever the view wrote last.
 
 ### Diffs in the Editor
 

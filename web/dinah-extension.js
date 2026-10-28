@@ -13,6 +13,10 @@
   commands(list){return ready.then(()=>request('commands',{commands:list}));},
   navigate(state){return ready.then(()=>request('navigate',{state}));},
   hostCommand(command,payload){let focusToken='';if(command==='focus-menubar'){focusToken=crypto.randomUUID();focusTargets.clear();focusTargets.set(focusToken,document.activeElement);}return ready.then(()=>request('host-command',{command,focusToken,payload})).then(result=>{if(command==='focus-menubar'&&!result?.focused)focusTargets.delete(focusToken);return result;},error=>{if(focusToken)focusTargets.delete(focusToken);throw error;});},
+  // A view that declares the file types it opens receives the file in its
+  // state as {open:{path,mediaType,resource,line}}. openedFile returns that
+  // file, or null for any other state.
+  openedFile(state){if(typeof state!=='string'||state.length>8192||!state.trim().startsWith('{'))return null;try{const file=JSON.parse(state)?.open;return file&&typeof file==='object'&&typeof file.path==='string'&&file.path&&typeof file.mediaType==='string'&&file.mediaType?file:null;}catch(error){return null;}},
   shared:{
    get(){return {...shared};},
    set(key,value){return ready.then(()=>request('shared-set',{key,value:value===undefined?null:value})).then(result=>{if(value===null||value===undefined)delete shared[key];else shared[key]=value;return result;});}

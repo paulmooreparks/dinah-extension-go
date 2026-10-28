@@ -40,6 +40,73 @@ type View struct {
 	// Follows makes a window take the selected workspace as a pane does,
 	// with a pin the person may set. A window without it pins at opening.
 	Follows bool `json:"follows,omitempty"`
+	// Opens lists the kinds of file this view opens when the person follows
+	// a link to one in Dinah. Only a window that is neither a pane nor
+	// following may declare it, since a file belongs to one workspace and
+	// such a window keeps the workspace it opened with.
+	Opens []FileType `json:"opens,omitempty"`
+}
+
+// FileType is a kind of file a view opens: an IANA media type, written in
+// lower case with no parameters, and the file extensions that have it.
+type FileType struct {
+	MediaType  string   `json:"mediaType"`
+	Extensions []string `json:"extensions"`
+}
+
+// Limits of the file types a manifest may declare.
+const (
+	FileTypesPerView      = 8
+	FileTypesPerManifest  = 32
+	ExtensionsPerFileType = 16
+	MediaTypeLimit        = 127
+)
+
+// A media type a view may open is a registered top-level type and a subtype
+// made of the characters RFC 6838 allows, in lower case. A wildcard such as
+// image/* is not a media type and does not match.
+var mediaType = regexp.MustCompile(`^(application|audio|font|image|model|text|video)/[a-z0-9][a-z0-9!#$&^_.+-]*$`)
+
+// A file extension is a dot and one segment of at most 31 lower-case letters,
+// digits, underscores, plus signs and hyphens.
+var fileExtension = regexp.MustCompile(`^\.[a-z0-9][a-z0-9_+-]{0,30}$`)
+
+// genericMediaTypes describe any file rather than a kind of file, so no view
+// may claim them.
+var genericMediaTypes = map[string]bool{"text/plain": true, "application/octet-stream": true}
+
+// ValidFileType says whether a file type may be declared by a view.
+func ValidFileType(t FileType) bool {
+	if len(t.MediaType) > MediaTypeLimit || !mediaType.MatchString(t.MediaType) || genericMediaTypes[t.MediaType] {
+		return false
+	}
+	if len(t.Extensions) == 0 || len(t.Extensions) > ExtensionsPerFileType {
+		return false
+	}
+	for _, e := range t.Extensions {
+		if !fileExtension.MatchString(e) {
+			return false
+		}
+	}
+	return true
+}
+
+// MinimumSDK is the earliest release of this SDK whose hosts accept the
+// manifest. A host rejects a manifest member it does not know, so a package
+// that uses a member added within contract 1 installs only in a host built
+// with the release that added it or a later one.
+func (m Manifest) MinimumSDK() string {
+	for _, a := range m.Actions {
+		if a.Effect != "" {
+			return "0.2.0"
+		}
+	}
+	for _, v := range m.Views {
+		if v.Follows || len(v.Opens) > 0 {
+			return "0.2.0"
+		}
+	}
+	return "0.1.0"
 }
 
 // Effect levels an action may declare.
@@ -65,6 +132,7 @@ func ValidEffect(effect string) bool {
 func EffectAsks(effect string) bool {
 	return effect == "" || effect == EffectHistory || effect == EffectNetwork
 }
+
 type Command struct {
 	ID     string `json:"id"`
 	Title  string `json:"title"`
@@ -168,11 +236,43 @@ func (m Manifest) Validate() error {
 		}
 	}
 	views := map[string]bool{}
+	types, extensions, declared := map[string]bool{}, map[string]bool{}, 0
 	for _, v := range m.Views {
 		if !localID.MatchString(v.ID) || views[v.ID] || v.Title == "" || !SafePath(v.Page) || !strings.HasSuffix(v.Page, ".html") {
 			return errors.New("invalid view")
 		}
 		views[v.ID] = true
+		if len(v.Opens) == 0 {
+			continue
+		}
+		if v.Pane || v.Follows {
+			return fmt.Errorf("view %s opens files, so it cannot be a pane or follow the selected workspace", v.ID)
+		}
+		if !Has(m.Permissions, "workspace.read") {
+			return fmt.Errorf("view %s opens files, which needs the workspace.read permission", v.ID)
+		}
+		if len(v.Opens) > FileTypesPerView {
+			return fmt.Errorf("view %s opens more than %d file types", v.ID, FileTypesPerView)
+		}
+		for _, t := range v.Opens {
+			if !ValidFileType(t) {
+				return fmt.Errorf("view %s declares an invalid file type %q", v.ID, t.MediaType)
+			}
+			if types[t.MediaType] {
+				return fmt.Errorf("media type %s is declared more than once", t.MediaType)
+			}
+			types[t.MediaType] = true
+			for _, e := range t.Extensions {
+				if extensions[e] {
+					return fmt.Errorf("file extension %s is declared more than once", e)
+				}
+				extensions[e] = true
+			}
+			declared++
+		}
+	}
+	if declared > FileTypesPerManifest {
+		return fmt.Errorf("an extension may declare at most %d file types", FileTypesPerManifest)
 	}
 	commands := map[string]bool{}
 	for _, c := range m.Commands {

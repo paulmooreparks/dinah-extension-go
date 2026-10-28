@@ -11,12 +11,28 @@ import (
 )
 
 type Installation struct {
-	Manifest       Manifest  `json:"manifest"`
-	Origin         string    `json:"origin"`
-	Installed      time.Time `json:"installed"`
-	Enabled        bool      `json:"enabled"`
+	Manifest  Manifest  `json:"manifest"`
+	Origin    string    `json:"origin"`
+	Installed time.Time `json:"installed"`
+	Enabled   bool      `json:"enabled"`
+	// EnabledAt is when the extension was last enabled after being disabled
+	// or absent. An update keeps it, so an extension keeps its place among
+	// the extensions that open the same kind of file. A registry written
+	// before this field existed has none; EnabledSince falls back to the
+	// installation time.
+	EnabledAt      time.Time `json:"enabledAt,omitzero"`
 	ReviewCommands bool      `json:"reviewCommands,omitempty"`
 }
+
+// EnabledSince is when the installation was enabled, for ordering the
+// extensions that declare the same file type: the first enabled is first.
+func (v Installation) EnabledSince() time.Time {
+	if !v.EnabledAt.IsZero() {
+		return v.EnabledAt
+	}
+	return v.Installed
+}
+
 type Store struct{ Root string }
 type Approval struct {
 	Fingerprint string `json:"fingerprint"`
@@ -159,9 +175,13 @@ func (s Store) Install(folder, origin string, approval Approval) (Installation, 
 			return Installation{}, err
 		}
 	}
-	v := Installation{Manifest: m, Origin: origin, Installed: time.Now().UTC(), Enabled: true}
+	now := time.Now().UTC()
+	v := Installation{Manifest: m, Origin: origin, Installed: now, Enabled: true, EnabledAt: now}
 	if old, ok := all[m.ID]; ok {
 		v.ReviewCommands = old.ReviewCommands
+		if old.Enabled {
+			v.EnabledAt = old.EnabledSince()
+		}
 	}
 	all[m.ID] = v
 	return v, s.write(all)
@@ -197,6 +217,12 @@ func (s Store) Enable(id string, enabled bool) error {
 	v, ok := all[id]
 	if !ok {
 		return errors.New("extension is not installed")
+	}
+	switch {
+	case enabled && !v.Enabled:
+		v.EnabledAt = time.Now().UTC()
+	case !enabled:
+		v.EnabledAt = time.Time{}
 	}
 	v.Enabled = enabled
 	all[id] = v

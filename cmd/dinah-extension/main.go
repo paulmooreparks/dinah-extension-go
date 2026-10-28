@@ -44,13 +44,13 @@ func run() error {
 		}
 		m, err := extension.Sign(os.Args[2], key)
 		if err == nil {
-			fmt.Println(m.ID, m.Version, extension.Fingerprint(m.Publisher.Key))
+			report(m)
 		}
 		return err
 	case "verify":
 		m, err := extension.Verify(os.Args[2])
 		if err == nil {
-			fmt.Println(m.ID, m.Version, extension.Fingerprint(m.Publisher.Key))
+			report(m)
 		}
 		return err
 	case "zip":
@@ -90,6 +90,16 @@ func run() error {
 		return z.Close()
 	}
 	return fmt.Errorf("unknown command")
+}
+
+// report prints a signed package's identity and fingerprint, and the
+// earliest SDK release whose hosts accept it when that is later than the
+// first release.
+func report(m extension.Manifest) {
+	fmt.Println(m.ID, m.Version, extension.Fingerprint(m.Publisher.Key))
+	if sdk := m.MinimumSDK(); sdk != "0.1.0" {
+		fmt.Println("This package installs only in a host built with SDK " + sdk + " or later.")
+	}
 }
 func main() {
 	if err := run(); err != nil {

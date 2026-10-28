@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -135,6 +136,158 @@ func TestEffectAndFollowsAreSignedAndUnknownFieldsRejected(t *testing.T) {
 	os.WriteFile(filepath.Join(root, ManifestFile), data, 0600)
 	if _, err = ReadManifest(root); err == nil {
 		t.Fatal("accepted an unknown manifest field")
+	}
+}
+func TestOpensIsSignedAndOptional(t *testing.T) {
+	root, key := packageFixture(t)
+	plain, err := Sign(root, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A manifest without the member signs as a manifest from before it.
+	data, _ := json.Marshal(plain)
+	if strings.Contains(string(data), `"opens"`) || plain.MinimumSDK() != "0.1.0" {
+		t.Fatal("a manifest without opens changed shape or minimum SDK")
+	}
+	m, _ := ReadManifest(root)
+	m.Views = append(m.Views, View{ID: "patch", Title: "Patch", Page: "index.html", Opens: []FileType{{MediaType: "text/x-diff", Extensions: []string{".diff", ".patch"}}}})
+	data, _ = json.Marshal(m)
+	os.WriteFile(filepath.Join(root, ManifestFile), data, 0600)
+	signed, err := Sign(root, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err := Verify(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verified.Signature != signed.Signature || len(verified.Views[1].Opens) != 1 || verified.Views[1].Opens[0].Extensions[1] != ".patch" {
+		t.Fatal("opens did not survive signing")
+	}
+	if verified.MinimumSDK() != "0.2.0" {
+		t.Fatal("a manifest with opens does not require 0.2.0")
+	}
+	// Changing the declared types after signing breaks the signature.
+	verified.Views[1].Opens[0].Extensions = []string{".diff"}
+	data, _ = json.Marshal(verified)
+	os.WriteFile(filepath.Join(root, ManifestFile), data, 0600)
+	if _, err = Verify(root); err == nil {
+		t.Fatal("accepted a changed file type after signing")
+	}
+}
+func TestOpensValidation(t *testing.T) {
+	root, _ := packageFixture(t)
+	base, err := ReadManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diff := FileType{MediaType: "text/x-diff", Extensions: []string{".diff", ".patch"}}
+	with := func(views ...View) Manifest {
+		m := base
+		m.Views = views
+		return m
+	}
+	window := func(id string, types ...FileType) View {
+		return View{ID: id, Title: id, Page: "index.html", Opens: types}
+	}
+	if err := with(window("patch", diff, FileType{MediaType: "application/vnd.example+json", Extensions: []string{".example"}})).Validate(); err != nil {
+		t.Fatal(err)
+	}
+	many := []string{}
+	for i := 0; i <= ExtensionsPerFileType; i++ {
+		many = append(many, fmt.Sprintf(".e%d", i))
+	}
+	tooManyTypes := []FileType{}
+	for i := 0; i <= FileTypesPerView; i++ {
+		tooManyTypes = append(tooManyTypes, FileType{MediaType: fmt.Sprintf("text/x-t%d", i), Extensions: []string{fmt.Sprintf(".t%d", i)}})
+	}
+	manifestWide := []View{}
+	for v := 0; v < 5; v++ {
+		types := []FileType{}
+		for i := 0; i < FileTypesPerView; i++ {
+			types = append(types, FileType{MediaType: fmt.Sprintf("text/x-v%d-%d", v, i), Extensions: []string{fmt.Sprintf(".v%d%d", v, i)}})
+		}
+		manifestWide = append(manifestWide, window(fmt.Sprintf("view%d", v), types...))
+	}
+	noRead := with(window("patch", diff))
+	noRead.Permissions = []string{"notification.post"}
+	noRead.Actions = []Action{{Name: "status", Title: "Status", InputSchema: json.RawMessage(`{}`), OutputSchema: json.RawMessage(`{}`), Replay: "pure"}}
+	for name, m := range map[string]Manifest{
+		"a wildcard type":                with(window("a", FileType{MediaType: "image/*", Extensions: []string{".img"}})),
+		"a wildcard over everything":     with(window("a", FileType{MediaType: "*/*", Extensions: []string{".any"}})),
+		"text/plain":                     with(window("a", FileType{MediaType: "text/plain", Extensions: []string{".txt"}})),
+		"application/octet-stream":       with(window("a", FileType{MediaType: "application/octet-stream", Extensions: []string{".bin"}})),
+		"an upper-case type":             with(window("a", FileType{MediaType: "Text/X-Diff", Extensions: []string{".diff"}})),
+		"a type with parameters":         with(window("a", FileType{MediaType: "text/x-diff; charset=utf-8", Extensions: []string{".diff"}})),
+		"an unregistered top-level type": with(window("a", FileType{MediaType: "chemical/x-pdb", Extensions: []string{".pdb"}})),
+		"a long type":                    with(window("a", FileType{MediaType: "text/x-" + strings.Repeat("a", MediaTypeLimit), Extensions: []string{".a"}})),
+		"no extensions":                  with(window("a", FileType{MediaType: "text/x-diff"})),
+		"an extension without a dot":     with(window("a", FileType{MediaType: "text/x-diff", Extensions: []string{"diff"}})),
+		"a two-part extension":           with(window("a", FileType{MediaType: "application/gzip", Extensions: []string{".tar.gz"}})),
+		"an upper-case extension":        with(window("a", FileType{MediaType: "text/x-diff", Extensions: []string{".DIFF"}})),
+		"a wildcard extension":           with(window("a", FileType{MediaType: "text/x-diff", Extensions: []string{".*"}})),
+		"too many extensions":            with(window("a", FileType{MediaType: "text/x-diff", Extensions: many})),
+		"too many types in a view":       with(window("a", tooManyTypes...)),
+		"too many types in the manifest": with(manifestWide...),
+		"a type declared twice":          with(window("a", diff), window("b", FileType{MediaType: "text/x-diff", Extensions: []string{".dif"}})),
+		"an extension declared twice":    with(window("a", diff), window("b", FileType{MediaType: "text/x-patch", Extensions: []string{".patch"}})),
+		"a pane":                         with(View{ID: "a", Title: "A", Page: "index.html", Pane: true, Opens: []FileType{diff}}),
+		"a following window":             with(View{ID: "a", Title: "A", Page: "index.html", Follows: true, Opens: []FileType{diff}}),
+		"no workspace.read":              noRead,
+	} {
+		if m.Validate() == nil {
+			t.Errorf("accepted %s", name)
+		}
+	}
+}
+func TestOpenState(t *testing.T) {
+	state, _ := json.Marshal(OpenState{Open: OpenedFile{Path: `C:\work\change.diff`, MediaType: "text/x-diff", Resource: FileResource{WorkspaceID: "ws", SourceID: "main", Path: "change.diff"}, Line: 12}})
+	file, ok := ParseOpenState(string(state))
+	if !ok || file.Path != `C:\work\change.diff` || file.Resource.SourceID != "main" || file.Line != 12 {
+		t.Fatalf("open state did not round-trip: %s", state)
+	}
+	for _, other := range []string{"", "branch=main", `{"open":{}}`, `{"view":"log"}`, "{" + strings.Repeat(" ", OpenStateLimit) + "}"} {
+		if _, ok := ParseOpenState(other); ok {
+			t.Errorf("read %q as an opened file", other)
+		}
+	}
+}
+func TestEnabledOrderSurvivesUpdates(t *testing.T) {
+	root, key := packageFixture(t)
+	m, err := Sign(root, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := Store{Root: filepath.Join(t.TempDir(), "extensions")}
+	approval := Approval{Fingerprint(m.Publisher.Key), m.Signature}
+	if _, err = s.Install(root, "fixture", approval); err != nil {
+		t.Fatal(err)
+	}
+	list, _ := s.List()
+	first := list[0].EnabledAt
+	if first.IsZero() {
+		t.Fatal("installation was not given an enabled time")
+	}
+	if _, err = s.Install(root, "fixture", approval); err != nil {
+		t.Fatal(err)
+	}
+	list, _ = s.List()
+	if !list[0].EnabledAt.Equal(first) {
+		t.Fatal("an update of an enabled extension moved its enabled time")
+	}
+	if err = s.Enable(m.ID, false); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.Enable(m.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	list, _ = s.List()
+	if list[0].EnabledAt.Before(first) || list[0].EnabledAt.IsZero() {
+		t.Fatal("enabling again did not record a new enabled time")
+	}
+	legacy := Installation{Installed: first}
+	if !legacy.EnabledSince().Equal(first) {
+		t.Fatal("a registry entry without an enabled time does not fall back to its installation time")
 	}
 }
 func TestDiffSpecValidation(t *testing.T) {
